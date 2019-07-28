@@ -201,6 +201,7 @@ pub struct Gfx2d<R: gfx::Resources> {
     buffer_pos: gfx::handle::Buffer<R, PositionFormat>,
     buffer_color: gfx::handle::Buffer<R, ColorFormat>,
     buffer_uv: gfx::handle::Buffer<R, TexCoordsFormat>,
+    buffer_indices: gfx::handle::Buffer<R, u16>,
     colored: PsoStencil<PipelineState<R, pipe_colored::Meta>>,
     textured: PsoStencil<PipelineState<R, pipe_textured::Meta>>,
 }
@@ -304,15 +305,22 @@ impl<R: gfx::Resources> Gfx2d<R> {
             gfx::memory::Usage::Dynamic,
             gfx::memory::Bind::empty()
         ).expect("Could not create `buffer_uv`");
+        let buffer_indices = factory.create_buffer(
+            BUFFER_SIZE,
+            gfx::buffer::Role::Vertex,
+            gfx::memory::Usage::Dynamic,
+            gfx::memory::Bind::empty()
+        ).expect("Could not create `buffer_indices`");
 
         Gfx2d {
             colored_offset: 0,
             colored_draw_state: Default::default(),
-            buffer_pos: buffer_pos,
-            buffer_color: buffer_color,
-            buffer_uv: buffer_uv,
-            colored: colored,
-            textured: textured,
+            buffer_pos,
+            buffer_indices,
+            buffer_color,
+            buffer_uv,
+            colored,
+            textured,
         }
     }
 
@@ -612,6 +620,106 @@ impl<'a, R, C> Graphics for GfxGraphics<'a, R, C>
                 buffer: gfx::IndexBuffer::Auto,
                 base_vertex: 0,
             };
+            encoder.draw(&slice, pso_textured, &data);
+        })
+    }
+
+    fn tri_list_uv_with_indices<F>(
+        &mut self,
+        draw_state: &DrawState,
+        color: &[f32; 4],
+        texture: &<Self as Graphics>::Texture,
+        mut f: F
+    )
+        where F: FnMut(&mut FnMut(&[[f32; 2]], &[[f32; 2]], &[u16]))
+    {
+        use draw_state::target::Rect;
+        use std::u16;
+
+        let color = gamma_srgb_to_linear(*color);
+        if self.g2d.colored_offset > 0 {
+            self.flush_colored();
+        }
+        let &mut GfxGraphics {
+            ref mut encoder,
+            output_color,
+            output_stencil,
+            g2d: &mut Gfx2d {
+                ref mut buffer_pos,
+                ref mut buffer_uv,
+                ref mut textured,
+                ref mut buffer_indices,
+                ..
+            },
+            ..
+        } = self;
+
+        let (pso_textured, stencil_val) = textured.stencil_blend(
+            draw_state.stencil,
+            draw_state.blend
+        );
+
+        let scissor = match draw_state.scissor {
+            None => Rect { x: 0, y: 0, w: u16::MAX, h: u16::MAX },
+            Some(r) => Rect { x: r[0] as u16, y: r[1] as u16,
+                w: r[2] as u16, h: r[3] as u16 }
+        };
+
+        let data = pipe_textured::Data {
+            pos: buffer_pos.clone(),
+            uv: buffer_uv.clone(),
+            color: color,
+            texture: (texture.view.clone(), texture.sampler.clone()),
+            blend_target: output_color.clone(),
+            stencil_target: (output_stencil.clone(),
+                             (stencil_val, stencil_val)),
+            blend_ref: [1.0; 4],
+            scissor: scissor,
+        };
+
+        f(&mut |vertices: &[[f32; 2]], texture_coords: &[[f32; 2]], indices: &[u16]| {
+            use std::slice::from_raw_parts;
+
+            assert_eq!(
+                vertices.len(),
+                texture_coords.len()
+            );
+            let n = indices.len();
+            unsafe {
+                encoder.update_buffer(
+                    &buffer_pos,
+                    from_raw_parts(
+                        vertices.as_ptr() as *const PositionFormat,
+                        n
+                    ),
+                    0
+                ).unwrap();
+                encoder.update_buffer(
+                    &buffer_uv,
+                    from_raw_parts(
+                        texture_coords.as_ptr() as *const TexCoordsFormat,
+                        n
+                    ),
+                    0
+                ).unwrap();
+                encoder.update_buffer(
+                    &buffer_indices,
+                    from_raw_parts(
+                        texture_coords.as_ptr() as *const u16,
+                        n
+                    ),
+                    0
+                ).unwrap();
+            }
+
+            let slice = gfx::Slice {
+                instances: None,
+                start: 0,
+                end: n as u32,
+                buffer: gfx::IndexBuffer::Index16(buffer_indices.clone()),
+                base_vertex: 0,
+            };
+            
             encoder.draw(&slice, pso_textured, &data);
         })
     }
